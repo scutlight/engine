@@ -194,6 +194,10 @@ void AndroidShellHolder::Launch(RunConfiguration config) {
     return;
   }
 
+  if (settings_.enable_async_shell_setup && !shell_->EnsureAsyncSetup()) {
+    return;
+  }
+
   shell_->RunEngine(std::move(config));
 }
 

@@ -62,16 +62,17 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
   std::promise<fml::WeakPtr<SnapshotDelegate>> snapshot_delegate_promise;
   auto snapshot_delegate_future = snapshot_delegate_promise.get_future();
   fml::TaskRunner::RunNowOrPostTask(
-      task_runners.GetRasterTaskRunner(), [&rasterizer_promise,  //
-                                           &snapshot_delegate_promise,
+      task_runners.GetRasterTaskRunner(), fml::MakeCopyable(
+	  [rasterizer_promise = std::move(rasterizer_promise),
+          snapshot_delegate_promise = std::move(snapshot_delegate_promise),
                                            on_create_rasterizer,  //
                                            shell = shell.get()    //
-  ]() {
+  ]() mutable {
         TRACE_EVENT0("flutter", "ShellSetupGPUSubsystem");
         std::unique_ptr<Rasterizer> rasterizer(on_create_rasterizer(*shell));
         snapshot_delegate_promise.set_value(rasterizer->GetSnapshotDelegate());
         rasterizer_promise.set_value(std::move(rasterizer));
-      });
+      }));
 
   // Create the platform view on the platform thread (this thread).
   auto platform_view = on_create_platform_view(*shell.get());
@@ -105,14 +106,14 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
   //
   // https://github.com/flutter/flutter/issues/42948
   fml::TaskRunner::RunNowOrPostTask(
-      io_task_runner,
-      [&io_manager_promise,                                               //
-       &weak_io_manager_promise,                                          //
-       &unref_queue_promise,                                              //
+      io_task_runner, fml::MakeCopyable(
+      [io_manager_promise = std::move(io_manager_promise),
+       weak_io_manager_promise = std::move(weak_io_manager_promise),
+       unref_queue_promise = std::move(unref_queue_promise),
        platform_view = platform_view->GetWeakPtr(),                       //
        io_task_runner,                                                    //
        is_backgrounded_sync_switch = shell->GetIsGpuDisabledSyncSwitch()  //
-  ]() {
+  ]() mutable {
         TRACE_EVENT0("flutter", "ShellSetupIOSubsystem");
         auto io_manager = std::make_unique<ShellIOManager>(
             platform_view.getUnsafe()->CreateResourceContext(),
@@ -120,7 +121,7 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
         weak_io_manager_promise.set_value(io_manager->GetWeakPtr());
         unref_queue_promise.set_value(io_manager->GetSkiaUnrefQueue());
         io_manager_promise.set_value(std::move(io_manager));
-      });
+      }));
 
   // Send dispatcher_maker to the engine constructor because shell won't have
   // platform_view set until Shell::Setup is called later.
@@ -129,17 +130,23 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
   // Create the engine on the UI thread.
   std::promise<std::unique_ptr<Engine>> engine_promise;
   auto engine_future = engine_promise.get_future();
+  if (settings.enable_async_shell_setup) {
+    shell->engine_future_ = std::move(engine_future);
+    shell->rasterizer_future_ = std::move(rasterizer_future);
+    shell->io_manager_future_ = std::move(io_manager_future);
+  }
+
   fml::TaskRunner::RunNowOrPostTask(
       shell->GetTaskRunners().GetUITaskRunner(),
-      fml::MakeCopyable([&engine_promise,                                 //
+      fml::MakeCopyable([engine_promise = std::move(engine_promise),
                          shell = shell.get(),                             //
-                         &dispatcher_maker,                               //
-                         &window_data,                                    //
+                         dispatcher_maker = std::move(dispatcher_maker),
+                         window_data,
                          isolate_snapshot = std::move(isolate_snapshot),  //
                          vsync_waiter = std::move(vsync_waiter),          //
-                         &weak_io_manager_future,                         //
-                         &snapshot_delegate_future,                       //
-                         &unref_queue_future                              //
+                         weak_io_manager_future = std::move(weak_io_manager_future),
+                         snapshot_delegate_future = std::move(snapshot_delegate_future),
+                         unref_queue_future = std::move(unref_queue_future)
   ]() mutable {
         TRACE_EVENT0("flutter", "ShellSetupUISubsystem");
         const auto& task_runners = shell->GetTaskRunners();
@@ -163,6 +170,11 @@ std::unique_ptr<Shell> Shell::CreateShellOnPlatformThread(
             snapshot_delegate_future.get()  //
             ));
       }));
+
+  if (settings.enable_async_shell_setup) {
+    shell->platform_view_ = std::move(platform_view);
+    return shell;
+  }
 
   if (!shell->Setup(std::move(platform_view),  //
                     engine_future.get(),       //
@@ -776,12 +788,35 @@ void Shell::OnPlatformViewDestroyed() {
 
 // |PlatformView::Delegate|
 void Shell::OnPlatformViewSetViewportMetrics(const ViewportMetrics& metrics) {
-  FML_DCHECK(is_setup_);
+  if (!settings_.enable_async_shell_setup) FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
 
   // This is the formula Android uses.
   // https://android.googlesource.com/platform/frameworks/base/+/master/libs/hwui/renderthread/CacheManager.cpp#41
   size_t max_bytes = metrics.physical_width * metrics.physical_height * 12 * 4;
+
+  if (settings_.enable_async_shell_setup && !is_setup_) {
+    auto gpu_task =
+        [&rasterizer = rasterizer_, max_bytes] {
+          if (rasterizer->GetWeakPtr()) {
+            rasterizer->GetWeakPtr()->SetResourceCacheMaxBytes(max_bytes, false);
+          }
+        };
+    async_setup_pending_tasks_.push(
+        std::make_pair(task_runners_.GetRasterTaskRunner(), gpu_task));
+
+    auto ui_task =
+        [&engine = engine_, metrics]() {
+          if (engine->GetWeakPtr()) {
+            engine->GetWeakPtr()->SetViewportMetrics(metrics);
+          }
+        };
+    async_setup_pending_tasks_.push(
+        std::make_pair(task_runners_.GetUITaskRunner(), ui_task));
+
+    return;
+  }
+
   task_runners_.GetRasterTaskRunner()->PostTask(
       [rasterizer = rasterizer_->GetWeakPtr(), max_bytes] {
         if (rasterizer) {
@@ -800,8 +835,20 @@ void Shell::OnPlatformViewSetViewportMetrics(const ViewportMetrics& metrics) {
 // |PlatformView::Delegate|
 void Shell::OnPlatformViewDispatchPlatformMessage(
     fml::RefPtr<PlatformMessage> message) {
-  FML_DCHECK(is_setup_);
+  if (!settings_.enable_async_shell_setup) FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
+
+  if (settings_.enable_async_shell_setup && !is_setup_) {
+    auto ui_task =
+        [&engine = engine_, message = std::move(message)] {
+          if (engine->GetWeakPtr()) {
+            engine->GetWeakPtr()->DispatchPlatformMessage(std::move(message));
+          }
+        };
+    async_setup_pending_tasks_.push(
+        std::make_pair(task_runners_.GetUITaskRunner(), ui_task));
+    return;
+  }
 
   task_runners_.GetUITaskRunner()->PostTask(
       [engine = engine_->GetWeakPtr(), message = std::move(message)] {
@@ -845,8 +892,20 @@ void Shell::OnPlatformViewDispatchSemanticsAction(int32_t id,
 
 // |PlatformView::Delegate|
 void Shell::OnPlatformViewSetSemanticsEnabled(bool enabled) {
-  FML_DCHECK(is_setup_);
+  if (!settings_.enable_async_shell_setup) FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
+
+  if (settings_.enable_async_shell_setup && !is_setup_) {
+    auto ui_task =
+        [&engine = engine_, enabled] {
+          if (engine->GetWeakPtr()) {
+            engine->GetWeakPtr()->SetSemanticsEnabled(enabled);
+          }
+        };
+    async_setup_pending_tasks_.push(
+        std::make_pair(task_runners_.GetUITaskRunner(), ui_task));
+    return;
+  }
 
   task_runners_.GetUITaskRunner()->PostTask(
       [engine = engine_->GetWeakPtr(), enabled] {
@@ -858,8 +917,20 @@ void Shell::OnPlatformViewSetSemanticsEnabled(bool enabled) {
 
 // |PlatformView::Delegate|
 void Shell::OnPlatformViewSetAccessibilityFeatures(int32_t flags) {
-  FML_DCHECK(is_setup_);
+  if (!settings_.enable_async_shell_setup) FML_DCHECK(is_setup_);
   FML_DCHECK(task_runners_.GetPlatformTaskRunner()->RunsTasksOnCurrentThread());
+
+  if (settings_.enable_async_shell_setup && !is_setup_) {
+    auto ui_task =
+        [&engine = engine_, flags] {
+          if (engine->GetWeakPtr()) {
+            engine->GetWeakPtr()->SetAccessibilityFeatures(flags);
+          }
+        };
+    async_setup_pending_tasks_.push(
+        std::make_pair(task_runners_.GetUITaskRunner(), ui_task));
+    return;
+  }
 
   task_runners_.GetUITaskRunner()->PostTask(
       [engine = engine_->GetWeakPtr(), flags] {
@@ -1540,6 +1611,31 @@ bool Shell::ReloadSystemFonts() {
 
 std::shared_ptr<fml::SyncSwitch> Shell::GetIsGpuDisabledSyncSwitch() const {
   return is_gpu_disabled_sync_switch_;
+}
+
+bool Shell::EnsureAsyncSetup() {
+  if (is_setup_) {
+    return true;
+  }
+
+  TRACE_EVENT0("flutter", "Shell::EnsureAsyncSetup");
+
+  if (Setup(std::move(platform_view_),
+            engine_future_.get(),
+            rasterizer_future_.get(),
+            io_manager_future_.get())) {
+    is_setup_ = true;
+
+    while (!async_setup_pending_tasks_.empty()) {
+      AsyncSetupPendingTask pending_task = async_setup_pending_tasks_.front();
+      async_setup_pending_tasks_.pop();
+      pending_task.first->PostTask(pending_task.second);
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 }  // namespace flutter

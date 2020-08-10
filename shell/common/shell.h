@@ -362,10 +362,20 @@ class Shell final : public PlatformView::Delegate,
   ///
   DartVM* GetDartVM();
 
+  bool EnsureAsyncSetup();
+
  private:
   using ServiceProtocolHandler =
       std::function<bool(const ServiceProtocol::Handler::ServiceProtocolMap&,
                          rapidjson::Document&)>;
+
+  using AsyncSetupPendingTask =
+      std::pair<fml::RefPtr<fml::TaskRunner>, fml::closure>;
+  std::queue<AsyncSetupPendingTask> async_setup_pending_tasks_;
+
+  std::future<std::unique_ptr<Engine>> engine_future_;
+  std::future<std::unique_ptr<Rasterizer>> rasterizer_future_;
+  std::future<std::unique_ptr<ShellIOManager>> io_manager_future_;
 
   const TaskRunners task_runners_;
   const Settings settings_;

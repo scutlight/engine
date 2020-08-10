@@ -73,6 +73,8 @@ void FlutterMain::Init(JNIEnv* env,
 
   auto settings = SettingsFromCommandLine(command_line);
 
+  settings.enable_async_shell_setup = true;
+
   int64_t init_time_micros = initTimeMillis * 1000;
   settings.engine_start_timestamp =
       std::chrono::microseconds(Dart_TimelineGetMicros() - init_time_micros);

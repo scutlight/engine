@@ -223,6 +223,8 @@ struct Settings {
   // https://github.com/flutter/flutter/issues/59930
   bool use_embedded_view = false;
 
+  bool enable_async_shell_setup = false;
+
   std::string ToString() const;
 };
 
